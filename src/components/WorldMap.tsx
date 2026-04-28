@@ -1,73 +1,174 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Shipment } from "@/lib/sample-data";
-import { cn } from "@/lib/utils";
 
-// Equirectangular projection
-function project(lat: number, lng: number, w: number, h: number) {
-  return { x: ((lng + 180) / 360) * w, y: ((90 - lat) / 180) * h };
+const API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
+
+let loaderPromise: Promise<typeof google> | null = null;
+function loadGoogleMaps(): Promise<typeof google> {
+  if (typeof window === "undefined") return Promise.reject(new Error("ssr"));
+  if ((window as any).google?.maps) return Promise.resolve((window as any).google);
+  if (loaderPromise) return loaderPromise;
+  loaderPromise = new Promise((resolve, reject) => {
+    if (!API_KEY) { reject(new Error("Missing VITE_GOOGLE_MAPS_API_KEY")); return; }
+    const cbName = `__gmaps_cb_${Date.now()}`;
+    (window as any)[cbName] = () => { resolve((window as any).google); delete (window as any)[cbName]; };
+    const s = document.createElement("script");
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${API_KEY}&callback=${cbName}&libraries=marker`;
+    s.async = true; s.defer = true;
+    s.onerror = () => reject(new Error("Failed to load Google Maps"));
+    document.head.appendChild(s);
+  });
+  return loaderPromise;
+}
+
+// Dark, slate-blue map style matching the app theme.
+const darkMapStyle: google.maps.MapTypeStyle[] = [
+  { elementType: "geometry", stylers: [{ color: "#1e293b" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#0f172a" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#94a3b8" }] },
+  { featureType: "administrative.country", elementType: "geometry.stroke", stylers: [{ color: "#475569" }] },
+  { featureType: "administrative.land_parcel", stylers: [{ visibility: "off" }] },
+  { featureType: "administrative.locality", elementType: "labels.text.fill", stylers: [{ color: "#cbd5e1" }] },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#334155" }] },
+  { featureType: "road", elementType: "labels", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0b1220" }] },
+  { featureType: "water", elementType: "labels.text.fill", stylers: [{ color: "#475569" }] },
+  { featureType: "landscape", elementType: "geometry", stylers: [{ color: "#1e293b" }] },
+];
+
+function colorFor(level: Shipment["riskLevel"]) {
+  return level === "critical" ? "#dc2626" : level === "high" ? "#ea580c" : level === "medium" ? "#eab308" : "#3b82f6";
 }
 
 export function WorldMap({ shipments, selectedId, onSelect, height = 420 }: {
   shipments: Shipment[]; selectedId?: string; onSelect?: (id: string) => void; height?: number;
 }) {
-  const W = 1000, H = 500;
-  const [hover, setHover] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<google.maps.Map | null>(null);
+  const overlaysRef = useRef<(google.maps.Polyline | google.maps.Marker)[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  // Init map once
+  useEffect(() => {
+    let cancelled = false;
+    loadGoogleMaps()
+      .then((g) => {
+        if (cancelled || !containerRef.current) return;
+        mapRef.current = new g.maps.Map(containerRef.current, {
+          center: { lat: 20, lng: 30 },
+          zoom: 2,
+          minZoom: 2,
+          disableDefaultUI: true,
+          zoomControl: true,
+          gestureHandling: "greedy",
+          backgroundColor: "#0b1220",
+          styles: darkMapStyle,
+        });
+        setLoaded(true);
+      })
+      .catch((e) => setError(e.message));
+    return () => { cancelled = true; };
+  }, []);
+
+  // Render shipments
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !loaded) return;
+    const g = (window as any).google as typeof google;
+
+    // Clear previous overlays
+    overlaysRef.current.forEach((o) => o.setMap(null));
+    overlaysRef.current = [];
+
+    shipments.forEach((s) => {
+      const isSel = s.id === selectedId;
+      const color = colorFor(s.riskLevel);
+
+      // Curved-ish path: sample a quadratic bezier between origin and destination
+      const o = s.origin, d = s.destination;
+      const cx = (o.lng + d.lng) / 2;
+      const cy = Math.max(o.lat, d.lat) + 15;
+      const path: google.maps.LatLngLiteral[] = [];
+      const steps = 32;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const lat = (1 - t) * (1 - t) * o.lat + 2 * (1 - t) * t * cy + t * t * d.lat;
+        const lng = (1 - t) * (1 - t) * o.lng + 2 * (1 - t) * t * cx + t * t * d.lng;
+        path.push({ lat, lng });
+      }
+
+      const line = new g.maps.Polyline({
+        path,
+        geodesic: false,
+        strokeColor: color,
+        strokeOpacity: isSel ? 0.95 : 0.55,
+        strokeWeight: isSel ? 3 : 1.5,
+        map,
+        icons: isSel ? [{ icon: { path: "M 0,-1 0,1", strokeOpacity: 1, scale: 3 }, offset: "0", repeat: "16px" }] : undefined,
+        zIndex: isSel ? 10 : 1,
+      });
+      line.addListener("click", () => onSelect?.(s.id));
+
+      // Origin / destination dots
+      const dot = (pos: google.maps.LatLngLiteral) =>
+        new g.maps.Marker({
+          position: pos, map,
+          icon: { path: g.maps.SymbolPath.CIRCLE, scale: 3, fillColor: color, fillOpacity: 0.9, strokeColor: "#0b1220", strokeWeight: 1 },
+          clickable: false,
+        });
+      overlaysRef.current.push(dot(o), dot(d));
+
+      // Current position
+      const cur = new g.maps.Marker({
+        position: { lat: s.currentLocation.lat, lng: s.currentLocation.lng },
+        map,
+        title: `${s.reference} · ${s.carrier}`,
+        icon: {
+          path: g.maps.SymbolPath.CIRCLE,
+          scale: isSel ? 8 : 6,
+          fillColor: color,
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 1.5,
+        },
+        zIndex: isSel ? 20 : 5,
+      });
+      cur.addListener("click", () => onSelect?.(s.id));
+
+      overlaysRef.current.push(line, cur);
+    });
+  }, [shipments, selectedId, loaded, onSelect]);
+
+  if (error) {
+    return (
+      <div className="w-full rounded-xl border border-border bg-card flex items-center justify-center text-center p-6" style={{ height }}>
+        <div>
+          <p className="text-sm font-medium">Map failed to load</p>
+          <p className="text-xs text-muted-foreground mt-1">{error}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative w-full overflow-hidden rounded-xl border border-border bg-card" style={{ height }}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full" preserveAspectRatio="xMidYMid slice">
-        <defs>
-          <radialGradient id="seaGrad" cx="50%" cy="50%" r="70%">
-            <stop offset="0%" stopColor="oklch(0.26 0.03 250)" />
-            <stop offset="100%" stopColor="oklch(0.18 0.02 250)" />
-          </radialGradient>
-          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="oklch(0.3 0.02 252)" strokeWidth="0.4" opacity="0.4" />
-          </pattern>
-        </defs>
-        <rect width={W} height={H} fill="url(#seaGrad)" />
-        <rect width={W} height={H} fill="url(#grid)" />
-
-        {/* Stylized continents */}
-        <g fill="oklch(0.32 0.025 252)" stroke="oklch(0.42 0.03 250)" strokeWidth="0.5" opacity="0.85">
-          <path d="M 130 110 Q 220 80 290 130 L 320 200 Q 280 240 230 250 L 180 240 Q 130 200 120 160 Z" />
-          <path d="M 250 290 Q 290 280 310 320 L 320 410 Q 290 460 270 440 L 250 380 Z" />
-          <path d="M 460 90 Q 540 70 580 110 L 590 170 Q 540 200 490 180 L 460 140 Z" />
-          <path d="M 470 200 Q 560 220 600 280 Q 580 380 530 410 L 490 360 Q 460 290 470 200 Z" />
-          <path d="M 620 90 Q 760 70 880 130 L 900 230 Q 820 290 720 270 L 640 220 Q 600 160 620 100 Z" />
-          <path d="M 800 320 Q 870 330 890 380 L 870 420 Q 820 410 800 380 Z" />
-        </g>
-
-        {/* Routes */}
-        {shipments.map((s) => {
-          const o = project(s.origin.lat, s.origin.lng, W, H);
-          const d = project(s.destination.lat, s.destination.lng, W, H);
-          const c = project(s.currentLocation.lat, s.currentLocation.lng, W, H);
-          const cx = (o.x + d.x) / 2, cy = Math.min(o.y, d.y) - 40;
-          const path = `M ${o.x} ${o.y} Q ${cx} ${cy} ${d.x} ${d.y}`;
-          const color = s.riskLevel === "critical" ? "oklch(0.62 0.24 27)" :
-                        s.riskLevel === "high" ? "oklch(0.65 0.23 30)" :
-                        s.riskLevel === "medium" ? "oklch(0.78 0.16 75)" : "oklch(0.65 0.18 245)";
-          const active = s.id === selectedId || s.id === hover;
-          return (
-            <g key={s.id} className="cursor-pointer" onClick={() => onSelect?.(s.id)} onMouseEnter={() => setHover(s.id)} onMouseLeave={() => setHover(null)}>
-              <path d={path} fill="none" stroke={color} strokeWidth={active ? 2 : 1} opacity={active ? 0.95 : 0.45} className={active ? "route-dash" : ""} />
-              <circle cx={o.x} cy={o.y} r={2.5} fill={color} opacity="0.7" />
-              <circle cx={d.x} cy={d.y} r={2.5} fill={color} opacity="0.7" />
-              <circle cx={c.x} cy={c.y} r={active ? 6 : 4} fill={color} stroke="oklch(0.97 0.01 250)" strokeWidth="1">
-                {s.riskLevel === "critical" && <animate attributeName="r" values="4;9;4" dur="1.8s" repeatCount="indefinite" />}
-              </circle>
-            </g>
-          );
-        })}
-      </svg>
-
-      <div className="absolute bottom-3 left-3 flex flex-wrap gap-2 text-[10px]">
+      <div ref={containerRef} className="absolute inset-0" />
+      {!loaded && (
+        <div className="absolute inset-0 flex items-center justify-center bg-card">
+          <div className="h-1 w-40 rounded-full bg-muted overflow-hidden">
+            <div className="h-full shimmer" style={{ background: "var(--gradient-primary)" }} />
+          </div>
+        </div>
+      )}
+      <div className="absolute bottom-3 left-3 flex flex-wrap gap-2 text-[10px] z-10 pointer-events-none">
         {[
-          { c: "oklch(0.65 0.18 245)", l: "Low" },
-          { c: "oklch(0.78 0.16 75)", l: "Medium" },
-          { c: "oklch(0.65 0.23 30)", l: "High" },
-          { c: "oklch(0.62 0.24 27)", l: "Critical" },
+          { c: "#3b82f6", l: "Low" },
+          { c: "#eab308", l: "Medium" },
+          { c: "#ea580c", l: "High" },
+          { c: "#dc2626", l: "Critical" },
         ].map((x) => (
           <div key={x.l} className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-background/80 backdrop-blur border border-border">
             <span className="h-2 w-2 rounded-full" style={{ background: x.c }} />
@@ -75,8 +176,8 @@ export function WorldMap({ shipments, selectedId, onSelect, height = 420 }: {
           </div>
         ))}
       </div>
-      <div className={cn("absolute top-3 right-3 px-2 py-1 rounded-md bg-background/80 backdrop-blur border border-border text-[10px] text-muted-foreground")}>
-        {shipments.length} active routes
+      <div className="absolute top-3 right-3 px-2 py-1 rounded-md bg-background/80 backdrop-blur border border-border text-[10px] text-muted-foreground z-10 pointer-events-none">
+        {shipments.length} active routes · Google Maps
       </div>
     </div>
   );
