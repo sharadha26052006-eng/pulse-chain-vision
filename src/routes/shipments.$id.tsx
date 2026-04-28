@@ -73,7 +73,7 @@ function ShipmentDetail() {
                   <div className="h-full rounded-full" style={{ width: `${s.riskScore}%`, background: s.riskLevel === "critical" || s.riskLevel === "high" ? "var(--gradient-risk)" : "var(--gradient-primary)" }} />
                 </div>
               </div>
-              {s.riskFactors.map((f) => (
+              {s.riskFactors.map((f: string) => (
                 <div key={f} className="flex items-start gap-2 p-2.5 rounded-lg border border-border">
                   <AlertTriangle className="h-3.5 w-3.5 text-warning mt-0.5 shrink-0" />
                   <span className="text-sm">{f}</span>
@@ -87,7 +87,7 @@ function ShipmentDetail() {
           <div className="rounded-xl border border-border bg-card p-5">
             <h3 className="font-semibold mb-4">Timeline</h3>
             <div className="space-y-0">
-              {s.timeline.map((t, i) => (
+              {s.timeline.map((t: typeof s.timeline[number], i: number) => (
                 <div key={i} className="flex gap-3 pb-4 last:pb-0">
                   <div className="flex flex-col items-center">
                     <div className={`h-3 w-3 rounded-full ${t.status === "done" ? "bg-success" : t.status === "current" ? "bg-primary ring-4 ring-primary/20" : "bg-muted border-2 border-border"}`} />
